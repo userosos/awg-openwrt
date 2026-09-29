@@ -1,4 +1,4 @@
-name: Build OpenWrt Snapshot
+name: Build OpenWrt Snapshot BPI r4 pro
 
 on:
   schedule:
