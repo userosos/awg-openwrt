@@ -1,0 +1,304 @@
+name: Build OpenWrt Snapshot
+
+on:
+  schedule:
+    # Запуск по расписанию (например, каждые 3 дня)
+    - cron: "17 21 */3 * *"
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: "Snapshot targets (strict mediatek)"
+        required: false
+        type: string
+        default: "mediatek"
+      subtargets:
+        description: "Snapshot subtargets (strict filogic)"
+        required: false
+        type: string
+        default: "filogic"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-openwrt-snapshot
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      targets: ${{ steps.inputs.outputs.targets }}
+      subtargets: ${{ steps.inputs.outputs.subtargets }}
+    steps:
+      - name: Prepare target filters
+        id: inputs
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          MANUAL_TARGETS: ${{ inputs.targets }}
+          MANUAL_SUBTARGETS: ${{ inputs.subtargets }}
+        run: |
+          set -euo pipefail
+
+          # Жестко закрепляем фильтры для BPI-R4 / Filogic по умолчанию, 
+          # если поля при ручном запуске остались пустыми
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            TARGET_FILTERS="${MANUAL_TARGETS:-mediatek}"
+            SUBTARGET_FILTERS="${MANUAL_SUBTARGETS:-filogic}"
+          else
+            TARGET_FILTERS="mediatek"
+            SUBTARGET_FILTERS="filogic"
+          fi
+
+          echo "targets=$TARGET_FILTERS" >> "$GITHUB_OUTPUT"
+          echo "subtargets=$SUBTARGET_FILTERS" >> "$GITHUB_OUTPUT"
+
+  discover:
+    runs-on: ubuntu-latest
+    needs: prepare
+    outputs:
+      job-config: ${{ steps.config.outputs.job-config }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Discover current Snapshot builds
+        id: config
+        env:
+          TARGETS: ${{ needs.prepare.outputs.targets }}
+          SUBTARGETS: ${{ needs.prepare.outputs.subtargets }}
+        run: node snapshot-index.js "$TARGETS" "$SUBTARGETS"
+
+  build:
+    name: "${{ matrix.build_env.revision }} - ${{ matrix.build_env.target }}/${{ matrix.build_env.subtarget }}"
+    runs-on: ubuntu-latest
+    needs: discover
+    strategy:
+      fail-fast: false
+      matrix:
+        build_env: ${{ fromJson(needs.discover.outputs.job-config) }}
+
+    steps:
+      - name: Check whether this Snapshot ABI is already published
+        id: existing
+        uses: actions/github-script@v7
+        env:
+          RELEASE_TAG: ${{ matrix.build_env.releaseTag }}
+          ARTIFACT_POSTFIX: ${{ matrix.build_env.artifactPostfix }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          result-encoding: string
+          script: |
+            const requiredPackages = [
+              'amneziawg-tools',
+              'kmod-amneziawg',
+              'luci-proto-amneziawg',
+              'luci-i18n-amneziawg-ru',
+            ];
+
+            try {
+              const { data: release } = await github.rest.repos.getReleaseByTag({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag: process.env.RELEASE_TAG,
+              });
+              const assets = await github.paginate(github.rest.repos.listReleaseAssets, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                release_id: release.id,
+                per_page: 100,
+              });
+              const names = new Set(assets.map(asset => asset.name));
+              return requiredPackages.every(name =>
+                names.has(`${name}_${process.env.ARTIFACT_POSTFIX}.apk`)
+              );
+            } catch (error) {
+              if (error.status === 404) {
+                return false;
+              }
+              throw error;
+            }
+
+      - name: Report unchanged Snapshot
+        if: steps.existing.outputs.result == 'true'
+        run: echo "Packages for this OpenWrt Snapshot ABI are already published."
+
+      - name: Checkout AWG source code
+        if: steps.existing.outputs.result != 'true'
+        uses: actions/checkout@v7
+
+      - name: Install build prerequisites
+        if: steps.existing.outputs.result != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-pyelftools zstd
+
+      - name: Cache OpenWrt Snapshot SDK
+        if: steps.existing.outputs.result != 'true'
+        id: cache-sdk
+        uses: actions/cache@v5
+        with:
+          path: openwrt-sdk-*/
+          key: ${{ runner.os }}-snapshot-sdk-${{ matrix.build_env.revision }}-${{ matrix.build_env.target }}-${{ matrix.build_env.subtarget }}-${{ matrix.build_env.vermagic }}
+
+      - name: Download and extract OpenWrt Snapshot SDK
+        if: steps.existing.outputs.result != 'true' && steps.cache-sdk.outputs.cache-hit != 'true'
+        env:
+          SDK_FILE: ${{ matrix.build_env.sdkFile }}
+          SDK_URL: ${{ matrix.build_env.sdkUrl }}
+        run: |
+          set -euo pipefail
+          wget -O "$SDK_FILE" "$SDK_URL"
+
+          case "$SDK_FILE" in
+            *.tar.zst) tar --zstd -xf "$SDK_FILE" ;;
+            *.tar.xz) tar -xf "$SDK_FILE" ;;
+            *) echo "Unsupported SDK archive: $SDK_FILE"; exit 1 ;;
+          esac
+
+      - name: Configure Snapshot SDK
+        if: steps.existing.outputs.result != 'true'
+        run: |
+          set -euo pipefail
+          SDK_DIR=$(find . -maxdepth 1 -name "openwrt-sdk-*" -type d -print -quit)
+          if [ -z "$SDK_DIR" ]; then
+            echo "OpenWrt Snapshot SDK directory was not found."
+            exit 1
+          fi
+
+          WORKSPACE_DIR=$(pwd)
+          cd "$SDK_DIR"
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+          cp -r "$WORKSPACE_DIR/kmod-amneziawg" package/
+          cp -r "$WORKSPACE_DIR/amneziawg-tools" package/
+          cp -r "$WORKSPACE_DIR/luci-proto-amneziawg" package/
+
+          {
+            echo "CONFIG_PACKAGE_kmod-amneziawg=m"
+            echo "CONFIG_PACKAGE_amneziawg-tools=y"
+            echo "CONFIG_PACKAGE_luci-proto-amneziawg=y"
+            echo "CONFIG_PACKAGE_luci-i18n-amneziawg-ru=y"
+          } > .config
+          make defconfig
+
+      - name: Build AmneziaWG packages
+        if: steps.existing.outputs.result != 'true'
+        run: |
+          set -euo pipefail
+          SDK_DIR=$(find . -maxdepth 1 -name "openwrt-sdk-*" -type d -print -quit)
+          cd "$SDK_DIR"
+
+          make package/kmod-amneziawg/{download,prepare} V=s
+          make package/kmod-amneziawg/compile V=s
+          make package/luci-proto-amneziawg/{download,prepare} V=s
+          make package/luci-proto-amneziawg/compile V=s
+          make package/amneziawg-tools/{download,prepare} V=s
+          make package/amneziawg-tools/compile V=s
+
+      - name: Prepare Snapshot artifacts
+        if: steps.existing.outputs.result != 'true'
+        env:
+          ARTIFACT_POSTFIX: ${{ matrix.build_env.artifactPostfix }}
+        run: |
+          set -euo pipefail
+          SDK_DIR=$(find . -maxdepth 1 -name "openwrt-sdk-*" -type d -print -quit)
+          mkdir -p awgrelease
+
+          copy_package() {
+            package_name="$1"
+            search_root="$2"
+            source_file=$(find "$search_root" -type f -name "${package_name}-*.apk" -print -quit)
+            if [ -z "$source_file" ]; then
+              echo "Package was not built: $package_name"
+              exit 1
+            fi
+            cp "$source_file" "awgrelease/${package_name}_${ARTIFACT_POSTFIX}.apk"
+          }
+
+          copy_package "amneziawg-tools" "$SDK_DIR/bin/packages"
+          copy_package "luci-proto-amneziawg" "$SDK_DIR/bin/packages"
+          copy_package "luci-i18n-amneziawg-ru" "$SDK_DIR/bin/packages"
+          copy_package "kmod-amneziawg" "$SDK_DIR/bin/targets"
+
+          ls -la awgrelease/
+
+      - name: Upload Snapshot packages for publishing
+        if: steps.existing.outputs.result != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: snapshot-packages-${{ matrix.build_env.revision }}-${{ matrix.build_env.target }}-${{ matrix.build_env.subtarget }}
+          path: awgrelease/*.apk
+          if-no-files-found: error
+          retention-days: 3
+
+  publish:
+    name: Publish Snapshot prereleases
+    runs-on: ubuntu-latest
+    needs: [discover, build]
+    if: always() && needs.discover.result == 'success'
+    steps:
+      - name: Download newly built Snapshot packages
+        id: download
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: snapshot-packages-*
+          path: snapshot-artifacts
+          merge-multiple: true
+
+      - name: Publish packages grouped by Snapshot revision
+        if: steps.download.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          assets=(snapshot-artifacts/*.apk)
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "No new Snapshot packages to publish."
+            exit 0
+          fi
+
+          declare -A release_tags=()
+          for asset in "${assets[@]}"; do
+            asset_name=$(basename "$asset")
+            artifact_postfix="${asset_name#*_}"
+            release_tag="${artifact_postfix%%_*}"
+            release_tags["$release_tag"]=1
+          done
+
+          while IFS= read -r release_tag; do
+            revision="${release_tag#snapshot-}"
+            release_assets=()
+
+            for asset in "${assets[@]}"; do
+              case "$(basename "$asset")" in
+                *_"${release_tag}"_*.apk) release_assets+=("$asset") ;;
+              esac
+            done
+
+            if ! gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              gh release create "$release_tag" \
+                --repo "$GITHUB_REPOSITORY" \
+                --target "$GITHUB_SHA" \
+                --title "OpenWrt Snapshot $revision" \
+                --notes "Automated AmneziaWG packages for OpenWrt Snapshot $revision. Select assets matching the exact target, subtarget and kernel ABI of the installed Snapshot." \
+                --prerelease
+            fi
+
+            gh release upload "$release_tag" "${release_assets[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+          done < <(printf '%s\n' "${!release_tags[@]}" | sort)
